@@ -5,6 +5,7 @@ As a lot of Eela Audio got sold off, a lot has been lost regarding software and 
 Firmware used to be send out to you. There was never a public download page for firmware and software.
 
 Credits for the working manual to https://interstage.dk/Sider/Produkter/Brochure_manual/Eela/Eela_Logos_man.pdf
+And also the brochure: https://interstage.dk/Sider/Produkter/Brochure_manual/Eela/Eela_Logos_bro.pdf
 
 If anyone has other firmware and LogosTool versions, please send me a message so that I can create an as complete page as possible.
 
