@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+import ctypes
 
 # Windows DPI fix: must be set before importing PySide6/Qt.
 # Prevents: SetProcessDpiAwarenessContext() failed: Access is denied.
@@ -49,8 +50,8 @@ from typing import Optional
 import serial
 import serial.tools.list_ports
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QEvent
-from PySide6.QtGui import QIcon, QAction, QStandardItemModel, QStandardItem, QFont
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QEvent, QTimer, QPoint
+from PySide6.QtGui import QIcon, QAction, QStandardItemModel, QStandardItem, QFont, QPixmap, QPainter, QColor, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QStyle,
@@ -88,7 +89,10 @@ except Exception:  # pragma: no cover
 
 KEYBOARD_ACTION = "Keyboard Shortcut"
 MIDI_ACTION = "MIDI"
+HUI_ACTION = "HUI Transport"
+MCU_ACTION = "Mackie Control Universal"
 APP_NAME = "EelaControllerBridge"
+APP_USER_MODEL_ID = "Eela.ControllerBridge.App"
 
 DAW_PRESETS = {
     # DAW presets
@@ -848,9 +852,9 @@ SETTINGS_PATH = Path.home() / ".eela_controller_bridge_settings.json"
 
 DEFAULT_MAPPINGS = [
     # name, hex pattern, action_type, shortcut_action, midi_action, shift_shortcut_action, shift_midi_action
-    ("START", "00 00 00 f8", KEYBOARD_ACTION, "ctrl+space", "start", "shift+space", "continue"),
-    ("STOP", "00 78 00 f8", KEYBOARD_ACTION, "space", "stop", "esc", "cc:90:127"),
-    ("RECORD", "00 00 f8", KEYBOARD_ACTION, "ctrl+r", "note:60", "ctrl+shift+r", "cc:91:127"),
+    ("START", "00 00 00 f8", KEYBOARD_ACTION, "ctrl+space", "hui:play", "shift+space", "hui:play"),
+    ("STOP", "00 78 00 f8", KEYBOARD_ACTION, "space", "hui:stop", "esc", "hui:stop"),
+    ("RECORD", "00 00 f8", KEYBOARD_ACTION, "ctrl+r", "hui:record", "ctrl+shift+r", "hui:record"),
     ("SHIFT", "00 f8 80 f8", KEYBOARD_ACTION, "shift", "cc:10:127", "", "", True, "as_shift_layer"),
     ("ZOOM IN", "00 80 80 f8", KEYBOARD_ACTION, "ctrl+plus", "cc:20:127", "ctrl+shift+plus", "cc:92:127"),
     ("ZOOM OUT", "00 78 80 f8", KEYBOARD_ACTION, "ctrl+minus", "cc:21:127", "ctrl+shift+minus", "cc:93:127"),
@@ -863,10 +867,10 @@ DEFAULT_MAPPINGS = [
     ("D-PAD LEFT", "00 80 78 f8", KEYBOARD_ACTION, "left", "cc:26:127", "home", "cc:100:127"),
     ("D-PAD RIGHT", "00 f8 78 f8", KEYBOARD_ACTION, "right", "cc:27:127", "end", "cc:101:127"),
     ("ON # LINE", "00 78 f8", KEYBOARD_ACTION, "enter", "note:63", "shift+enter", "cc:102:127"),
-    ("JOG LEFT", "78 78 f8", KEYBOARD_ACTION, "left", "cc:28:127", "ctrl+left", "cc:103:65"),
-    ("JOG RIGHT", "78 f8 00", KEYBOARD_ACTION, "right", "cc:29:127", "ctrl+right", "cc:103:63"),
-    ("SHUTTLE LEFT", "00 f8 00 78 f8 00", KEYBOARD_ACTION, "j", "cc:30:127", "shift+j", "cc:104:65"),
-    ("SHUTTLE RIGHT", "00 80 00 78 80 00", KEYBOARD_ACTION, "l", "cc:31:127", "shift+l", "cc:104:63"),
+    ("JOG LEFT", "78 78 f8", KEYBOARD_ACTION, "left", "hui:jog_left", "ctrl+left", "hui:jog_left"),
+    ("JOG RIGHT", "78 f8 00", KEYBOARD_ACTION, "right", "hui:jog_right", "ctrl+right", "hui:jog_right"),
+    ("SHUTTLE LEFT", "00 f8 00 78 f8 00", KEYBOARD_ACTION, "j", "mcu:shuttle_left", "shift+j", "mcu:jog_left"),
+    ("SHUTTLE RIGHT", "00 80 00 78 80 00", KEYBOARD_ACTION, "l", "mcu:shuttle_right", "shift+l", "mcu:jog_right"),
 ]
 
 
@@ -917,7 +921,28 @@ def normalize_action_type(value: str) -> str:
     value = str(value).strip().lower()
     if value in {"midi", "midi action"}:
         return MIDI_ACTION
+    if value in {"hui", "hui transport", "mackie hui"}:
+        return HUI_ACTION
+    if value in {"mcu", "mackie control", "mackie control universal", "mackie control universal transport"}:
+        return MCU_ACTION
     return KEYBOARD_ACTION
+
+
+def normalize_surface_action_prefix(action: str, wanted_prefix: str) -> str:
+    """Keep HUI/MCU labels consistent with the selected Action Type.
+
+    Internally HUI and MCU transport use the same small transport sender here, but the UI/logs
+    should not show `hui:play` while the row is set to Mackie Control Universal, or vice versa.
+    """
+    action = str(action).strip()
+    if not action:
+        return action
+    lower = action.lower()
+    if lower.startswith("hui:") or lower.startswith("mcu:"):
+        return f"{wanted_prefix}:{action.split(':', 1)[1]}"
+    if wanted_prefix in {"hui", "mcu"}:
+        return f"{wanted_prefix}:{action}"
+    return action
 
 
 def clean_hex(value: str) -> str:
@@ -1247,12 +1272,19 @@ class ActionRunner:
         if not mapping.enabled:
             return
 
-        if normalize_action_type(mapping.action_type) == KEYBOARD_ACTION:
+        action_type = normalize_action_type(mapping.action_type)
+        if action_type == KEYBOARD_ACTION:
             action = mapping.shift_shortcut_action if shift_active and mapping.shift_shortcut_action else mapping.shortcut_action
             self.send_hotkey(action)
-        else:
+        elif action_type == MIDI_ACTION:
             action = mapping.shift_midi_action if shift_active and mapping.shift_midi_action else mapping.midi_action
             self.send_midi(action)
+        elif action_type == HUI_ACTION:
+            action = mapping.shift_midi_action if shift_active and mapping.shift_midi_action else mapping.midi_action
+            self.send_hui(normalize_surface_action_prefix(action, "hui"))
+        elif action_type == MCU_ACTION:
+            action = mapping.shift_midi_action if shift_active and mapping.shift_midi_action else mapping.midi_action
+            self.send_mcu(normalize_surface_action_prefix(action, "mcu"))
 
     def send_hotkey(self, combo: str):
         combo = combo.strip().lower()
@@ -1296,6 +1328,68 @@ class ActionRunner:
             "numpad*": "multiply",
         }
         return aliases.get(token, token)
+
+    def send_note_button(self, note: int, velocity: int = 127, channel: int = 0):
+        if self.midi_out is None:
+            raise RuntimeError("No MIDI output selected")
+        # Some DAWs/control-surface listeners miss an instant press+release.
+        # Send a short, real button press instead.
+        self.midi_out.send(mido.Message("note_on", note=note, velocity=velocity, channel=channel))
+        time.sleep(0.035)
+        self.midi_out.send(mido.Message("note_off", note=note, velocity=0, channel=channel))
+
+    def send_hui(self, value: str):
+        self.send_mackie_transport(value, prefix="hui")
+
+    def send_mcu(self, value: str):
+        self.send_mackie_transport(value, prefix="mcu")
+
+    def send_mackie_transport(self, value: str, prefix: str = "mcu"):
+        if mido is None:
+            raise RuntimeError("mido is not installed")
+        if self.midi_out is None:
+            raise RuntimeError("No MIDI output selected")
+
+        value = value.strip().lower()
+        if not value:
+            return
+        if value.startswith("hui:") or value.startswith("mcu:"):
+            value = value.split(":", 1)[1]
+
+        # Mackie Control / HUI-style transport buttons on MIDI channel 1.
+        # Transport notes: rewind=91, fast_forward=92, stop=93, play=94, record=95.
+        transport_notes = {
+            "rewind": 91,
+            "rew": 91,
+            "fast_forward": 92,
+            "ff": 92,
+            "ffwd": 92,
+            "stop": 93,
+            "play": 94,
+            "start": 94,
+            "record": 95,
+            "rec": 95,
+        }
+
+        if value in transport_notes:
+            self.send_note_button(transport_notes[value])
+            return
+
+        # Jog/scrub wheel: CC 60, relative-style values.
+        # Common MCU convention: 1 = clockwise/right, 65 = counter-clockwise/left.
+        if value in {"jog_left", "scrub_left"}:
+            self.midi_out.send(mido.Message("control_change", control=60, value=65, channel=0))
+        elif value in {"jog_right", "scrub_right"}:
+            self.midi_out.send(mido.Message("control_change", control=60, value=1, channel=0))
+        elif value == "shuttle_left":
+            # Use jog/scrub pulses instead of transport rewind.
+            # Reaper may interpret MCU rewind/fast-forward notes as jump-to-start/end.
+            self.midi_out.send(mido.Message("control_change", control=60, value=65, channel=0))
+        elif value == "shuttle_right":
+            # Use jog/scrub pulses instead of transport fast-forward.
+            self.midi_out.send(mido.Message("control_change", control=60, value=1, channel=0))
+        else:
+            raise ValueError(f"{prefix.upper()} action must be {prefix}:play, {prefix}:stop, {prefix}:record, {prefix}:rewind, {prefix}:fast_forward, {prefix}:jog_left, {prefix}:jog_right, {prefix}:shuttle_left, or {prefix}:shuttle_right")
 
     def send_midi(self, value: str):
         if mido is None:
@@ -1345,7 +1439,48 @@ class MainWindow(QMainWindow):
         self.worker: Optional[SerialWorker] = None
         self.learn_row: Optional[int] = None
         self.last_trigger: dict[str, float] = {}
+        self.serial_buffer = bytearray()
+        self.partial_packet_waiting = False
         self.shift_active = False
+
+        # Shuttle latch: real shuttle rings hold a speed/direction. The Eela sends bursts,
+        # so we keep pulsing for a short time after the last shuttle packet.
+        self.shuttle_direction: Optional[str] = None
+        self.shuttle_last_seen = 0.0
+        self.shuttle_interval_ms = 55
+        self.shuttle_hold_seconds = 9999.0
+        self.shuttle_speed_level = 1
+        self.last_logged_shuttle_speed_level = 0
+        self.shuttle_recent_hits: list[float] = []
+        self.shuttle_speed_window_seconds = 0.65
+        self.shuttle_neutral_patterns = {
+            bytes.fromhex("00 78 00 78 78 00"),
+            bytes.fromhex("78 00 78 78 00"),
+        }
+
+        # Jog acceleration: quick wheel turns should produce more movement.
+        self.jog_recent_hits: list[float] = []
+        self.jog_speed_window_seconds = 0.30
+
+        # Extra jogwheel variants seen when spinning the wheel quickly.
+        # The Eela appears to emit slightly different quadrature/state packets at speed.
+        self.jog_alias_patterns = {
+            bytes.fromhex("78 78 f8"): "JOG LEFT",
+            bytes.fromhex("78 f8 00"): "JOG RIGHT",
+            bytes.fromhex("78 80 f8 f8"): "JOG LEFT",
+            bytes.fromhex("78 00 f8 f8"): "JOG LEFT",
+            bytes.fromhex("78 f8 f8 f8"): "JOG LEFT",
+            bytes.fromhex("78 f8 f8"): "JOG LEFT",
+            bytes.fromhex("78 78"): "JOG RIGHT",
+            bytes.fromhex("78 80 00"): "JOG RIGHT",
+            bytes.fromhex("f8 00"): "JOG RIGHT",
+            bytes.fromhex("78 78 00"): "JOG RIGHT",
+            bytes.fromhex("78 00 00"): "JOG RIGHT",
+            bytes.fromhex("80 00"): "JOG RIGHT",
+            bytes.fromhex("78 00"): "JOG RIGHT",
+        }
+        self.shuttle_timer = QTimer(self)
+        self.shuttle_timer.timeout.connect(self.tick_shuttle)
         self.shift_push_pattern = bytes.fromhex("00 f8 80 f8")
         self.shift_release_pattern = bytes.fromhex("00 f8 00")
 
@@ -1429,6 +1564,8 @@ class MainWindow(QMainWindow):
 
         self.toggle_log_btn = QPushButton("Show console log")
         self.clear_log_btn = QPushButton("Clear log")
+        self.log_all_packets_checkbox = QCheckBox("Log all raw packets")
+        self.log_all_packets_checkbox.setChecked(bool(self.settings.get("log_all_raw_packets", False)))
         self.clear_log_btn.setEnabled(False)
         self.console_log = QPlainTextEdit()
         self.console_log.setReadOnly(True)
@@ -1454,13 +1591,41 @@ class MainWindow(QMainWindow):
         if self.settings.get("start_sniffing_automatically", False):
             self.start_serial()
 
+    def create_tray_icon(self) -> QIcon:
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # High-contrast teal circle works well on both light and dark themes.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#00A3A3"))
+        painter.drawEllipse(6, 6, 52, 52)
+
+        # White transport/play symbol.
+        painter.setBrush(QColor("#FFFFFF"))
+        triangle = QPolygon([
+            QPoint(25, 18),
+            QPoint(25, 46),
+            QPoint(48, 32),
+        ])
+        painter.drawPolygon(triangle)
+        painter.end()
+
+        return QIcon(pixmap)
+
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        icon = self.create_tray_icon()
         self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("Eela Controller Bridge")
         self.setWindowIcon(icon)
 
         tray_menu = QMenu()
+
+        presets_menu = QMenu("Presets", self)
+        self.build_tray_presets_menu(presets_menu)
 
         show_action = QAction("Show", self)
         hide_action = QAction("Hide", self)
@@ -1470,6 +1635,8 @@ class MainWindow(QMainWindow):
         hide_action.triggered.connect(self.hide)
         quit_action.triggered.connect(self.force_quit)
 
+        tray_menu.addMenu(presets_menu)
+        tray_menu.addSeparator()
         tray_menu.addAction(show_action)
         tray_menu.addAction(hide_action)
         tray_menu.addSeparator()
@@ -1478,6 +1645,36 @@ class MainWindow(QMainWindow):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
+
+    def build_tray_presets_menu(self, presets_menu: QMenu):
+        categories = {
+            "DAW": QMenu("DAW", self),
+            "NLE": QMenu("NLE", self),
+            "Playout": QMenu("Playout", self),
+        }
+
+        for preset_name in DAW_PRESETS.keys():
+            if " / " not in preset_name:
+                continue
+            category, display_name = preset_name.split(" / ", 1)
+            if category not in categories:
+                continue
+
+            action = QAction(display_name, self)
+            action.triggered.connect(lambda checked=False, name=preset_name: self.apply_preset_by_name(name))
+            categories[category].addAction(action)
+
+        for menu in categories.values():
+            presets_menu.addMenu(menu)
+
+    def apply_preset_by_name(self, preset_name: str):
+        for i in range(self.preset_combo.count()):
+            if self.preset_combo.itemData(i, Qt.UserRole) == preset_name:
+                self.preset_combo.setCurrentIndex(i)
+                break
+        self.apply_selected_preset()
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setToolTip("Eela Controller Bridge" + chr(10) + f"Preset: {preset_name}")
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -1546,6 +1743,7 @@ class MainWindow(QMainWindow):
         log_buttons = QHBoxLayout()
         log_buttons.addWidget(self.toggle_log_btn)
         log_buttons.addWidget(self.clear_log_btn)
+        log_buttons.addWidget(self.log_all_packets_checkbox)
         log_buttons.addStretch(1)
         root.addLayout(log_buttons)
         root.addWidget(self.console_log)
@@ -1688,6 +1886,10 @@ class MainWindow(QMainWindow):
         self.console_log.clear()
         self.clear_log_btn.setEnabled(False)
 
+    def save_log_options(self):
+        self.settings["log_all_raw_packets"] = self.log_all_packets_checkbox.isChecked()
+        save_settings(self.settings)
+
     def connect_signals(self):
         self.refresh_ports_btn.clicked.connect(self.refresh_ports)
         self.refresh_midi_btn.clicked.connect(self.refresh_midi_ports)
@@ -1702,6 +1904,7 @@ class MainWindow(QMainWindow):
         self.load_last_preset_checkbox.stateChanged.connect(self.save_preset_options)
         self.toggle_log_btn.clicked.connect(self.toggle_console_log)
         self.clear_log_btn.clicked.connect(self.clear_console_log)
+        self.log_all_packets_checkbox.stateChanged.connect(self.save_log_options)
         self.github_btn.clicked.connect(self.open_github)
         self.midi_combo.currentTextChanged.connect(self.change_midi_port)
         self.port_combo.currentIndexChanged.connect(self.save_selected_ports)
@@ -1791,7 +1994,7 @@ class MainWindow(QMainWindow):
             hex_item = QTableWidgetItem(mapping.hex_pattern)
 
             action_combo = QComboBox()
-            action_combo.addItems([KEYBOARD_ACTION, MIDI_ACTION])
+            action_combo.addItems([KEYBOARD_ACTION, MIDI_ACTION, HUI_ACTION, MCU_ACTION])
             action_combo.setCurrentText(normalize_action_type(mapping.action_type))
             action_combo.currentTextChanged.connect(lambda _=None: self.read_table())
 
@@ -1852,6 +2055,9 @@ class MainWindow(QMainWindow):
         self.worker_thread.started.connect(self.worker.run)
         self.worker.packet.connect(self.handle_packet)
         self.worker.status.connect(self.status_label.setText)
+        self.worker.status.connect(
+            lambda text: self.tray_icon.setToolTip("Eela Controller Bridge" + chr(10) + str(text))
+        )
         self.worker.error.connect(self.show_error)
         self.worker_thread.start()
 
@@ -1880,6 +2086,15 @@ class MainWindow(QMainWindow):
         self.last_hex_label.setText(f"Last HEX: {hex_text}")
         self.log_box.setText(hex_text)
 
+        if self.log_all_packets_checkbox.isChecked():
+            self.append_console_log(hex_text, "raw")
+
+        if data in self.shuttle_neutral_patterns:
+            self.stop_shuttle_latch("shuttle neutral")
+            self.last_decoded_label.setText("Decoded: shuttle neutral")
+            self.append_console_log(hex_text, "shuttle neutral")
+            return
+
         self.read_table()
         shift_mapping = next((m for m in self.mappings if m.name.upper() == "SHIFT"), None)
         shift_is_layer = bool(shift_mapping and getattr(shift_mapping, "shift_mode", "yes") == "as_shift_layer")
@@ -1890,7 +2105,7 @@ class MainWindow(QMainWindow):
             self.append_console_log(hex_text, "SHIFT layer active")
             return
 
-        if shift_is_layer and data == self.shift_release_pattern:
+        if shift_is_layer and self.shift_active and data == self.shift_release_pattern:
             self.shift_active = False
             self.last_decoded_label.setText("Decoded: SHIFT layer inactive")
             self.append_console_log(hex_text, "SHIFT layer inactive")
@@ -1906,6 +2121,17 @@ class MainWindow(QMainWindow):
 
         matched = self.find_match(data)
         if not matched:
+            jog_alias_name = self.jog_alias_patterns.get(data)
+            if jog_alias_name:
+                matched = next((m for m in self.mappings if m.name.upper() == jog_alias_name), None)
+
+        if not matched:
+            if self.partial_packet_waiting:
+                # This chunk is probably part of a larger shuttle/jog packet.
+                self.last_decoded_label.setText("Decoded: waiting for packet...")
+                if self.log_all_packets_checkbox.isChecked():
+                    self.append_console_log(hex_text, "partial / waiting")
+                return
             self.last_decoded_label.setText("Decoded: unknown")
             self.append_console_log(hex_text, "unknown")
             return
@@ -1921,35 +2147,213 @@ class MainWindow(QMainWindow):
 
         key = matched.hex_pattern + (":shift" if self.shift_active else ":normal")
         now = time.time()
-        if now - self.last_trigger.get(key, 0) < 0.10:
+
+        # Normal buttons need debounce, but jog/shuttle controls need repeated packets
+        # to pass through because their repeat rate effectively becomes speed.
+        control_name = matched.name.upper()
+        if "SHUTTLE" in control_name:
+            debounce_time = 0.015
+        elif "JOG" in control_name:
+            debounce_time = 0.0
+        else:
+            debounce_time = 0.10
+
+        if now - self.last_trigger.get(key, 0) < debounce_time:
             return
         self.last_trigger[key] = now
 
+        self.update_shuttle_latch(matched)
+
         try:
-            self.runner.run(matched, self.shift_active)
+            if "JOG" in matched.name.upper():
+                pulses = self.get_jog_pulse_count()
+                for _ in range(pulses):
+                    self.runner.run(matched, self.shift_active)
+            else:
+                self.runner.run(matched, self.shift_active)
         except Exception as exc:
             self.status_label.setText(f"Action error: {exc}")
 
+    def get_jog_pulse_count(self) -> int:
+        now = time.time()
+        self.jog_recent_hits.append(now)
+        self.jog_recent_hits = [
+            t for t in self.jog_recent_hits
+            if now - t <= self.jog_speed_window_seconds
+        ]
+        hits = len(self.jog_recent_hits)
+
+        # Fast jogwheel turns generate more events; convert that into extra pulses.
+        if hits <= 2:
+            return 1
+        if hits <= 5:
+            return 2
+        if hits <= 9:
+            return 3
+        return 5
+
+    def update_shuttle_latch(self, mapping: Mapping):
+        name = mapping.name.upper()
+
+        # Any non-shuttle transport/navigation action should cancel a latched shuttle.
+        if "SHUTTLE LEFT" not in name and "SHUTTLE RIGHT" not in name:
+            if name in {"STOP", "START", "RECORD", "JOG LEFT", "JOG RIGHT"}:
+                self.stop_shuttle_latch("cancelled by control")
+                # Jog is momentary; it should never leave a latched shuttle direction active.
+                self.shuttle_direction = None
+            return
+
+        if "SHUTTLE LEFT" in name:
+            self.shuttle_direction = "left"
+        elif "SHUTTLE RIGHT" in name:
+            self.shuttle_direction = "right"
+
+        now = time.time()
+        self.shuttle_last_seen = now
+        self.shuttle_recent_hits.append(now)
+        self.update_shuttle_speed(now)
+
+        if not self.shuttle_timer.isActive():
+            self.shuttle_timer.start(self.shuttle_interval_ms)
+
+    def update_shuttle_speed(self, now: Optional[float] = None):
+        now = now or time.time()
+        self.shuttle_recent_hits = [
+            t for t in self.shuttle_recent_hits
+            if now - t <= self.shuttle_speed_window_seconds
+        ]
+        hits = len(self.shuttle_recent_hits)
+
+        # Approximate a real shuttle ring: more incoming packets means a more extreme
+        # ring position, which means more MCU jog pulses per tick.
+        if hits <= 1:
+            self.shuttle_speed_level = 1
+        elif hits <= 3:
+            self.shuttle_speed_level = 2
+        elif hits <= 6:
+            self.shuttle_speed_level = 4
+        else:
+            self.shuttle_speed_level = 8
+
+        if self.log_all_packets_checkbox.isChecked() and self.shuttle_direction and self.shuttle_speed_level != self.last_logged_shuttle_speed_level:
+            self.last_logged_shuttle_speed_level = self.shuttle_speed_level
+            self.append_console_log(
+                "-",
+                f"shuttle state: direction={self.shuttle_direction}, speed={self.shuttle_speed_level}, hits={hits}"
+            )
+
+    def stop_shuttle_latch(self, reason: str = ""):
+        was_active = bool(self.shuttle_direction)
+        self.shuttle_direction = None
+        self.shuttle_speed_level = 1
+        self.last_logged_shuttle_speed_level = 0
+        self.shuttle_recent_hits.clear()
+        self.shuttle_timer.stop()
+        if was_active and reason:
+            self.append_console_log("-", f"shuttle stopped: {reason}")
+
+    def tick_shuttle(self):
+        if not self.shuttle_direction:
+            self.shuttle_timer.stop()
+            return
+
+        if time.time() - self.shuttle_last_seen > self.shuttle_hold_seconds:
+            self.stop_shuttle_latch("timeout")
+            return
+
+        # Keep moving while latched. Speed is based on how many shuttle packets arrived
+        # recently: slow turn = 1 pulse, hard turn = multiple pulses per tick.
+        self.update_shuttle_speed()
+        try:
+            if self.shuttle_direction == "left":
+                for _ in range(self.shuttle_speed_level):
+                    self.runner.send_mcu("mcu:jog_left")
+            elif self.shuttle_direction == "right":
+                for _ in range(self.shuttle_speed_level):
+                    self.runner.send_mcu("mcu:jog_right")
+        except Exception as exc:
+            self.status_label.setText(f"Shuttle error: {exc}")
+            self.shuttle_direction = None
+            self.shuttle_timer.stop()
+
     def get_active_action_value(self, mapping: Mapping) -> str:
-        if normalize_action_type(mapping.action_type) == KEYBOARD_ACTION:
+        action_type = normalize_action_type(mapping.action_type)
+        if action_type == KEYBOARD_ACTION:
             return mapping.shift_shortcut_action if self.shift_active and mapping.shift_shortcut_action else mapping.shortcut_action
-        return mapping.shift_midi_action if self.shift_active and mapping.shift_midi_action else mapping.midi_action
+
+        value = mapping.shift_midi_action if self.shift_active and mapping.shift_midi_action else mapping.midi_action
+        if action_type == HUI_ACTION:
+            return normalize_surface_action_prefix(value, "hui")
+        if action_type == MCU_ACTION:
+            return normalize_surface_action_prefix(value, "mcu")
+        return value
 
     def find_match(self, data: bytes) -> Optional[Mapping]:
-        for mapping in self.mappings:
-            try:
-                if mapping.enabled and data == mapping.pattern_bytes:
-                    return mapping
-            except ValueError:
-                continue
+        # Serial reads can split a real Eela packet into multiple chunks, especially with
+        # shuttle/jog streams. Keep a small rolling buffer so partial chunks can be matched
+        # once the next bytes arrive.
+        self.partial_packet_waiting = False
+        self.serial_buffer.extend(data)
+        if len(self.serial_buffer) > 128:
+            self.serial_buffer = self.serial_buffer[-128:]
 
+        buffer_bytes = bytes(self.serial_buffer)
+
+        # 1) Search the rolling buffer first. This is important because the end of a
+        # SHUTTLE packet can look like a standalone JOG packet, e.g.:
+        #   00 f8 00 78 + f8 00 = SHUTTLE LEFT
+        # If we exact-match `f8 00` too early, shuttle gets cancelled by fake jog.
+        candidates = []
         for mapping in self.mappings:
             try:
                 pattern = mapping.pattern_bytes
-                if mapping.enabled and pattern and pattern in data:
+                if not mapping.enabled or not pattern:
+                    continue
+
+                # Never substring-match very short normal patterns. They create false positives.
+                if len(pattern) < 4:
+                    continue
+
+                idx = buffer_bytes.find(pattern)
+                if idx >= 0:
+                    candidates.append((mapping, idx, len(pattern)))
+            except ValueError:
+                continue
+
+        if candidates:
+            mapping, idx, plen = max(candidates, key=lambda item: item[2])
+            del self.serial_buffer[: idx + plen]
+            return mapping
+
+        # 2) If the current buffer is a prefix/partial of a known longer packet, wait.
+        # This must happen before exact-matching short jog aliases.
+        for mapping in self.mappings:
+            try:
+                pattern = mapping.pattern_bytes
+                if len(pattern) < 4:
+                    continue
+
+                if pattern.startswith(buffer_bytes):
+                    self.partial_packet_waiting = True
+                    return None
+
+                for keep_len in range(1, min(len(buffer_bytes), len(pattern)) + 1):
+                    if pattern.startswith(buffer_bytes[-keep_len:]):
+                        self.serial_buffer = bytearray(buffer_bytes[-keep_len:])
+                        self.partial_packet_waiting = True
+                        return None
+            except ValueError:
+                continue
+
+        # 3) Exact match this read. Useful for real short packets like jogwheel aliases.
+        for mapping in self.mappings:
+            try:
+                if mapping.enabled and data == mapping.pattern_bytes:
+                    self.serial_buffer.clear()
                     return mapping
             except ValueError:
                 continue
+
         return None
 
     def add_mapping(self):
@@ -2010,7 +2414,7 @@ def ensure_qt_conf_for_windows():
         return
 
     qt_conf_path = Path(__file__).resolve().parent / "qt.conf"
-    qt_conf_text = "[Platforms]\nWindowsArguments = dpiawareness=0\n"
+    qt_conf_text = "[Platforms]" + chr(10) + "WindowsArguments = dpiawareness=0" + chr(10)
 
     try:
         existing_text = ""
@@ -2026,15 +2430,23 @@ def ensure_qt_conf_for_windows():
 def main():
     ensure_qt_conf_for_windows()
 
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
+
     qt_args = list(sys.argv)
     if sys.platform.startswith("win") and "-platform" not in qt_args:
         qt_args += ["-platform", "windows:dpiawareness=0"]
 
     app = QApplication(qt_args)
     window = MainWindow()
+    app.setWindowIcon(window.create_tray_icon())
     # MainWindow decides whether to show or start hidden based on settings.
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
+
