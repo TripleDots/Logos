@@ -27,3 +27,32 @@ https://github.com/otya128/winevdm
 
 
 Will update if I find a way to firmware upgrade.
+
+============================
+
+Eela Controller Bridge tool
+
+I vibecoded a tool to translate the transport controls,jog/shuttle wheel and d-pad (2,4,6,8 and ON # LINE button on the numpad) to MIDI and/or key shortcuts.
+This way you are able to use your Eela Logos in any audio/video software.
+I added presets of a lot of software.
+It should be cross platform, but I only tested it fully on Windows 11.
+
+Eela Controller Bridge
+Cross-platform Python GUI for sniffing RS-232 button packets from an Eela Logos / D902
+and mapping them to keyboard shortcuts or MIDI messages.
+
+Tested conceptually for Windows, macOS, Linux.
+
+Install:
+    py -3.12 -m pip install pyserial PySide6 pyautogui mido python-rtmidi
+
+If you only want keyboard mappings and sniffing, python-rtmidi is optional:
+    py -3.12 -m pip install pyserial PySide6 pyautogui mido
+
+Run:
+    py -3.12 eela_controller_bridge.py
+
+Notes:
+- Do not name this file "serial.py" or "import serial.py".
+- On macOS, keyboard output may require Accessibility permission.
+- On Windows, create a virtual MIDI port with loopMIDI if you want MIDI output.
