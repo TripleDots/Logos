@@ -56,4 +56,5 @@ Notes:
 - When you open the software on Windows, it doesn't open on your task bar. It's in the hidden icons next to the time in on the taskbar.
 - Do not name this file "serial.py" or "import serial.py".
 - On macOS, keyboard output may require Accessibility permission.
-- On Windows, create a virtual MIDI port with loopMIDI if you want MIDI output.
+- On Windows, create a virtual MIDI port with loopMIDI or LoopBe1 if you want MIDI output.
+- Use Mackie Control Universal protocol where possible. That way, the app doesn't have to be in focus while still giving you control.
